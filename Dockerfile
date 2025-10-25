@@ -35,6 +35,9 @@ WORKDIR /app
 # Copy the application files
 COPY . .
 
+# Install additional diagnostic dependencies
+RUN pip3 install --no-cache-dir matplotlib
+
 # Install PyTorch with CUDA 12.6 first, then other packages
 RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 && \

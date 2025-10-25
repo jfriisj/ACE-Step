@@ -9,6 +9,7 @@ peft
 # Audio Processing
 librosa==0.11.0
 soundfile==0.13.1
+pydub
 
 # Language Processing
 tokenizers
@@ -41,6 +42,9 @@ matplotlib==3.10.1
 
 # CLI
 click
+
+# File System Monitoring
+watchdog
 
 # Jupyter (Optional - uncomment if using notebooks)
 # ipython

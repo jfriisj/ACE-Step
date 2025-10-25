@@ -104,6 +104,7 @@ class ACEStepPipeline:
         cpu_offload=False,
         quantized=False,
         overlapped_decode=False,
+        enable_optimizations=True,
         **kwargs,
     ):
         if not checkpoint_dir:
@@ -139,6 +140,20 @@ class ACEStepPipeline:
         self.cpu_offload = cpu_offload
         self.quantized = quantized
         self.overlapped_decode = overlapped_decode
+        
+        # Optimization features
+        self.enable_optimizations = enable_optimizations
+        self._performance_metrics = {
+            'warmup_time': 0,
+            'preprocessing_time': [],
+            'memory_usage': [],
+            'warmed_up': False
+        }
+        self._tensor_pool = {}
+        
+        # Initialize optimizations if enabled
+        if self.enable_optimizations:
+            self._setup_optimizations()
 
     def cleanup_memory(self):
         """Clean up GPU and CPU memory to prevent VRAM overflow during multiple generations."""
@@ -154,6 +169,154 @@ class ACEStepPipeline:
         # Collect Python garbage
         import gc
         gc.collect()
+
+    def _setup_optimizations(self):
+        """Initialize optimization features"""
+        logger.info("🚀 Setting up pipeline optimizations...")
+        
+        try:
+            self._setup_tensor_preallocation()
+            logger.info("✅ Pipeline optimizations initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to setup optimizations: {e}")
+            self.enable_optimizations = False
+
+    def _setup_tensor_preallocation(self):
+        """Pre-allocate commonly used tensor shapes"""
+        if not hasattr(self, 'device') or not hasattr(self, 'dtype'):
+            return  # Device and dtype not set yet
+            
+        common_durations = [15, 30, 60, 120]  # seconds
+        
+        for duration in common_durations:
+            frame_length = int(duration * 44100 / 512 / 8)
+            cache_key = f"duration_{duration}s"
+            self._tensor_pool[cache_key] = {}
+            
+            try:
+                # Pre-allocate common tensor shapes
+                shapes = {
+                    'latents': (1, 8, 16, frame_length),
+                    'attention_mask': (1, frame_length),
+                }
+                
+                for tensor_name, shape in shapes.items():
+                    self._tensor_pool[cache_key][tensor_name] = torch.empty(
+                        shape, 
+                        device=self.device if hasattr(self, 'device') else 'cpu',
+                        dtype=self.dtype if hasattr(self, 'dtype') else torch.float32,
+                        pin_memory=True if hasattr(self, 'device') and self.device.type == 'cuda' else False
+                    )
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                # Skip this duration if we run out of memory
+                if cache_key in self._tensor_pool:
+                    del self._tensor_pool[cache_key]
+
+    def optimized_cleanup_memory(self):
+        """Enhanced memory cleanup with detailed monitoring"""
+        if torch.cuda.is_available():
+            allocated_before = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved_before = torch.cuda.memory_reserved() / (1024 ** 3)
+            
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            
+            allocated_after = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved_after = torch.cuda.memory_reserved() / (1024 ** 3)
+            
+            freed_memory = (allocated_before - allocated_after) + (reserved_before - reserved_after)
+            if freed_memory > 0.1:  # Only log if significant memory freed
+                logger.debug(f"🧹 Memory cleanup: freed {freed_memory:.2f}GB")
+            
+            # Store metrics
+            self._performance_metrics['memory_usage'].append({
+                'timestamp': time.time(),
+                'allocated_gb': allocated_after,
+                'reserved_gb': reserved_after,
+                'freed_gb': freed_memory
+            })
+        
+        # Aggressive garbage collection
+        import gc
+        gc.collect()
+
+    def warmup_pipeline(self, quick_warmup=True):
+        """Warm up pipeline for faster inference"""
+        if self._performance_metrics.get('warmed_up', False):
+            logger.debug("Pipeline already warmed up - skipping")
+            return
+            
+        logger.info("🔥 Starting pipeline warmup...")
+        warmup_start = time.time()
+        
+        # Ensure models are loaded
+        if not self.loaded:
+            logger.info("📦 Loading checkpoints during warmup...")
+            if self.quantized:
+                self.load_quantized_checkpoint(self.checkpoint_dir)
+            else:
+                self.load_checkpoint(self.checkpoint_dir)
+        
+        # Quick warmup with small tensors
+        try:
+            with torch.no_grad():
+                # Warm up text encoder
+                logger.debug("🔤 Warming up text encoder...")
+                dummy_texts = ["warmup text"]
+                self.get_text_embeddings(dummy_texts)
+                
+                # Warm up lyric tokenizer
+                logger.debug("🎵 Warming up lyric tokenizer...")
+                dummy_lyrics = "[Verse]\nWarmup lyrics\n"
+                self.tokenize_lyrics(dummy_lyrics)
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Warmup encountered error (continuing): {e}")
+        
+        warmup_time = time.time() - warmup_start
+        self._performance_metrics['warmup_time'] = warmup_time
+        self._performance_metrics['warmed_up'] = True
+        
+        # Cleanup after warmup
+        if self.enable_optimizations:
+            self.optimized_cleanup_memory()
+        else:
+            self.cleanup_memory()
+        
+        logger.info(f"✅ Pipeline warmup completed in {warmup_time:.2f}s")
+
+    def parallel_preprocess(self, prompt: str, lyrics: str):
+        """Process text and lyrics in parallel using threading"""
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                text_future = executor.submit(lambda: self.get_text_embeddings([prompt]))
+                lyric_future = executor.submit(lambda: self.tokenize_lyrics(lyrics))
+                
+                text_result = text_future.result(timeout=30)
+                lyric_result = lyric_future.result(timeout=30)
+                return text_result, lyric_result
+        except Exception as e:
+            logger.debug(f"Parallel preprocessing failed, using sequential: {e}")
+            # Fallback to sequential processing
+            text_result = self.get_text_embeddings([prompt])
+            lyric_result = self.tokenize_lyrics(lyrics)
+            return text_result, lyric_result
+
+    def get_performance_summary(self):
+        """Get performance metrics summary"""
+        metrics = self._performance_metrics.copy()
+        
+        # Calculate averages
+        if metrics['preprocessing_time']:
+            metrics['avg_preprocessing_time'] = sum(metrics['preprocessing_time']) / len(metrics['preprocessing_time'])
+        
+        # Add current GPU info
+        if torch.cuda.is_available():
+            metrics['current_gpu_allocated'] = torch.cuda.memory_allocated() / (1024 ** 3)
+            metrics['current_gpu_reserved'] = torch.cuda.memory_reserved() / (1024 ** 3)
+        
+        return metrics
 
     def get_checkpoint_path(self, checkpoint_dir, repo):
         checkpoint_dir_models = None
@@ -1475,44 +1638,283 @@ class ACEStepPipeline:
             
             sf.write(output_path_wav, audio_numpy, sample_rate)
         else:
-            # Use torchaudio for other formats
-            backend = "soundfile"
-            if format == "ogg":
-                backend = "sox"
-            logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
-            try:
-                torchaudio.save(
-                    output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
-                )
-            except (RuntimeError, ImportError) as e:
-                if "torchcodec" in str(e).lower():
-                    # Fallback to soundfile for any torchcodec issues
-                    logger.warning(f"TorchAudio failed with torchcodec error, falling back to soundfile: {e}")
-                    
-                    # For soundfile fallback, convert to WAV format (soundfile works best with WAV)
-                    fallback_path = output_path_wav
-                    if not fallback_path.lower().endswith('.wav'):
-                        fallback_path = fallback_path.rsplit('.', 1)[0] + '.wav'
-                        logger.info(f"Converting format to WAV for soundfile compatibility: {fallback_path}")
-                    
-                    audio_numpy = target_wav.cpu().numpy()
-                    
-                    # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
-                    if audio_numpy.ndim == 3:  # Remove any extra dimensions
-                        audio_numpy = audio_numpy.squeeze(0)
-                    if audio_numpy.ndim == 2:
-                        # If shape is (channels, samples), transpose to (samples, channels)
-                        if audio_numpy.shape[0] < audio_numpy.shape[1]:
-                            audio_numpy = audio_numpy.T
-                        # If mono (1, samples) or (samples, 1), squeeze to 1D
-                        if audio_numpy.shape[1] == 1:
-                            audio_numpy = audio_numpy.squeeze(-1)
-                    
-                    sf.write(fallback_path, audio_numpy, sample_rate)
-                    output_path_wav = fallback_path  # Update the path to return the correct file
-                else:
-                    raise e
+            # Smart format handling with prioritized fallbacks
+            success = False
+            
+            logger.info(f"Saving audio to {output_path_wav} using format '{format}'")
+            
+            # For MP3, use the most reliable methods first
+            if format == "mp3":
+                # Method 1: Try FFmpeg command line (most reliable)
+                success = self._try_ffmpeg_conversion(target_wav, output_path_wav, sample_rate)
+                
+                # Method 2: Try pydub if FFmpeg failed
+                if not success:
+                    success = self._try_pydub_conversion(target_wav, output_path_wav, sample_rate, format)
+                
+                # Method 3: Try torchaudio as last resort
+                if not success:
+                    success = self._try_torchaudio_conversion(target_wav, output_path_wav, sample_rate, format)
+            
+            # For other formats, use torchaudio first, then fallback
+            else:
+                success = self._try_torchaudio_conversion(target_wav, output_path_wav, sample_rate, format)
+                
+                # Fallback for non-MP3 formats
+                if not success:
+                    success = self._fallback_to_wav_conversion(target_wav, output_path_wav, sample_rate, format)
+                
+            if not success:
+                raise RuntimeError(f"Failed to save audio in {format.upper()} format using all available methods")
+        
+        # Run automatic diagnostics if enabled
+        try:
+            from .diagnostic_service import get_diagnostic_service
+            diagnostic_service = get_diagnostic_service()
+            diagnostic_result = diagnostic_service.auto_diagnose_callback(output_path_wav)
+            
+            if diagnostic_result and diagnostic_result.get('errors'):
+                logger.warning(f"Generated file has diagnostic errors: {diagnostic_result['errors']}")
+            elif diagnostic_result and diagnostic_result.get('warnings'):
+                logger.info(f"Generated file has minor issues: {diagnostic_result['warnings']}")
+            else:
+                logger.debug("Generated file passed diagnostic checks")
+                
+        except Exception as e:
+            logger.warning(f"Failed to run diagnostics on generated file: {str(e)}")
+        
         return output_path_wav
+
+    def _try_torchaudio_conversion(self, target_wav, output_path_wav, sample_rate, format):
+        """Try converting using torchaudio with appropriate backend"""
+        try:
+            # Convert tensor to proper format for torchaudio
+            audio_tensor = target_wav
+            if audio_tensor.ndim == 3:  # Remove batch dimension if present
+                audio_tensor = audio_tensor.squeeze(0)
+            if audio_tensor.ndim == 1:  # Add channel dimension for mono
+                audio_tensor = audio_tensor.unsqueeze(0)
+            
+            # Select appropriate backend
+            if format == "ogg":
+                backends_to_try = ["sox", "soundfile"]
+            elif format == "mp3":
+                backends_to_try = ["ffmpeg", "sox"]
+            elif format == "flac":
+                backends_to_try = ["soundfile", "sox"]
+            else:
+                backends_to_try = ["soundfile"]
+            
+            # Try each backend
+            for backend in backends_to_try:
+                try:
+                    torchaudio.save(
+                        output_path_wav, audio_tensor, sample_rate=sample_rate, 
+                        format=format, backend=backend
+                    )
+                    logger.info(f"Successfully saved {format.upper()} using torchaudio with {backend} backend")
+                    return True
+                    
+                except Exception as e:
+                    logger.debug(f"torchaudio {backend} backend failed for {format}: {e}")
+                    continue
+            
+            logger.warning(f"All torchaudio backends failed for {format}")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"torchaudio conversion failed: {e}")
+            return False
+
+    def _try_pydub_conversion(self, target_wav, output_path_wav, sample_rate, format):
+        """Try converting using pydub"""
+        try:
+            from pydub import AudioSegment
+            import tempfile
+            
+            # Save as temporary WAV first
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+            
+            # Convert tensor to numpy and save as WAV
+            audio_numpy = target_wav.cpu().numpy()
+            if audio_numpy.ndim == 3:
+                audio_numpy = audio_numpy.squeeze(0)
+            if audio_numpy.ndim == 2:
+                if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                    audio_numpy = audio_numpy.T
+                if audio_numpy.shape[1] == 1:
+                    audio_numpy = audio_numpy.squeeze(-1)
+            
+            sf.write(temp_wav.name, audio_numpy, sample_rate)
+            
+            # Load with pydub and export
+            audio = AudioSegment.from_wav(temp_wav.name)
+            
+            if format == "mp3":
+                audio.export(output_path_wav, format="mp3", bitrate="192k")
+            elif format == "ogg":
+                audio.export(output_path_wav, format="ogg")
+            elif format == "flac":
+                audio.export(output_path_wav, format="flac")
+            else:
+                raise ValueError(f"Unsupported format for pydub: {format}")
+            
+            # Clean up temp file
+            os.unlink(temp_wav.name)
+            
+            logger.info(f"Successfully saved {format.upper()} using pydub")
+            return True
+            
+        except ImportError:
+            logger.debug("pydub not available")
+            return False
+        except Exception as e:
+            logger.warning(f"pydub conversion failed: {e}")
+            try:
+                if 'temp_wav' in locals():
+                    os.unlink(temp_wav.name)
+            except:
+                pass
+            return False
+
+    def _try_ffmpeg_conversion(self, target_wav, output_path_wav, sample_rate):
+        """Try converting audio using FFmpeg command line tool"""
+        try:
+            import subprocess
+            import tempfile
+            
+            # First save as temporary WAV file
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+            
+            # Convert tensor to numpy and save as WAV
+            audio_numpy = target_wav.cpu().numpy()
+            if audio_numpy.ndim == 3:
+                audio_numpy = audio_numpy.squeeze(0)
+            if audio_numpy.ndim == 2:
+                if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                    audio_numpy = audio_numpy.T
+                if audio_numpy.shape[1] == 1:
+                    audio_numpy = audio_numpy.squeeze(-1)
+            
+            sf.write(temp_wav.name, audio_numpy, sample_rate)
+            
+            # Use FFmpeg to convert WAV to MP3
+            cmd = [
+                'ffmpeg', '-y', '-i', temp_wav.name,
+                '-codec:a', 'libmp3lame', '-b:a', '192k',
+                output_path_wav
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            # Clean up temp file
+            os.unlink(temp_wav.name)
+            
+            if result.returncode == 0:
+                logger.info("Successfully converted to MP3 using FFmpeg command line")
+                return True
+            else:
+                logger.warning(f"FFmpeg conversion failed: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"FFmpeg command line conversion failed: {e}")
+            try:
+                if 'temp_wav' in locals():
+                    os.unlink(temp_wav.name)
+            except:
+                pass
+            return False
+
+    def _fallback_to_wav_conversion(self, target_wav, output_path_wav, sample_rate, target_format):
+        """Fallback method: save as WAV first, then convert using available tools"""
+        try:
+            import tempfile
+            import subprocess
+            
+            # Save as temporary WAV
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+            
+            # Convert and save as WAV
+            audio_numpy = target_wav.cpu().numpy()
+            if audio_numpy.ndim == 3:
+                audio_numpy = audio_numpy.squeeze(0)
+            if audio_numpy.ndim == 2:
+                if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                    audio_numpy = audio_numpy.T
+                if audio_numpy.shape[1] == 1:
+                    audio_numpy = audio_numpy.squeeze(-1)
+            
+            sf.write(temp_wav.name, audio_numpy, sample_rate)
+            
+            # Try different conversion approaches
+            conversion_success = False
+            
+            # 1. Try FFmpeg if available
+            if target_format == "mp3":
+                cmd = ['ffmpeg', '-y', '-i', temp_wav.name, '-codec:a', 'libmp3lame', '-b:a', '192k', output_path_wav]
+            elif target_format == "ogg":
+                cmd = ['ffmpeg', '-y', '-i', temp_wav.name, '-codec:a', 'libvorbis', output_path_wav]
+            elif target_format == "flac":
+                cmd = ['ffmpeg', '-y', '-i', temp_wav.name, '-codec:a', 'flac', output_path_wav]
+            else:
+                cmd = None
+            
+            if cmd:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    if result.returncode == 0:
+                        conversion_success = True
+                        logger.info(f"Successfully converted to {target_format.upper()} using FFmpeg")
+                except Exception as e:
+                    logger.warning(f"FFmpeg conversion to {target_format} failed: {e}")
+            
+            # 2. If FFmpeg failed, try pydub as alternative
+            if not conversion_success:
+                try:
+                    from pydub import AudioSegment
+                    
+                    # Load WAV with pydub
+                    audio = AudioSegment.from_wav(temp_wav.name)
+                    
+                    # Export in target format
+                    if target_format == "mp3":
+                        audio.export(output_path_wav, format="mp3", bitrate="192k")
+                    elif target_format == "ogg":
+                        audio.export(output_path_wav, format="ogg")
+                    elif target_format == "flac":
+                        audio.export(output_path_wav, format="flac")
+                    
+                    conversion_success = True
+                    logger.info(f"Successfully converted to {target_format.upper()} using pydub")
+                    
+                except ImportError:
+                    logger.warning("pydub not available for format conversion")
+                except Exception as e:
+                    logger.warning(f"pydub conversion to {target_format} failed: {e}")
+            
+            # 3. Last resort: just rename to WAV and warn user
+            if not conversion_success:
+                wav_path = output_path_wav.rsplit('.', 1)[0] + '.wav'
+                os.rename(temp_wav.name, wav_path)
+                logger.warning(f"Could not convert to {target_format.upper()}, saved as WAV instead: {wav_path}")
+                return wav_path
+            else:
+                # Clean up temp file
+                os.unlink(temp_wav.name)
+                return True
+                
+        except Exception as e:
+            logger.error(f"Fallback conversion failed: {e}")
+            try:
+                if 'temp_wav' in locals():
+                    os.unlink(temp_wav.name)
+            except:
+                pass
+            return False
 
     @cpu_offload("music_dcae")
     def infer_latents(self, input_audio_path):
@@ -1594,6 +1996,10 @@ class ACEStepPipeline:
                 self.load_quantized_checkpoint(self.checkpoint_dir)
             else:
                 self.load_checkpoint(self.checkpoint_dir)
+
+        # Auto-warmup if optimizations enabled and not yet warmed up
+        if self.enable_optimizations and not self._performance_metrics.get('warmed_up', False):
+            self.warmup_pipeline(quick_warmup=True)
 
         self.load_lora(lora_name_or_path, lora_weight)
         load_model_cost = time.time() - start_time
@@ -1784,7 +2190,10 @@ class ACEStepPipeline:
         )
 
         # Clean up memory after generation
-        self.cleanup_memory()
+        if self.enable_optimizations:
+            self.optimized_cleanup_memory()
+        else:
+            self.cleanup_memory()
 
         end_time = time.time()
         latent2audio_time_cost = end_time - start_time

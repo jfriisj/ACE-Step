@@ -16,6 +16,11 @@ services:
       - ./cache:/home/appuser/.cache
     environment:
       - ACE_OUTPUT_DIR=/app/outputs
+      - ACE_AUTO_DIAGNOSE=true
+      - ACE_DIAGNOSTIC_DIR=/app/outputs/diagnostics
+      - ACE_DIAGNOSTIC_LOG_LEVEL=INFO
+      - ACE_DIAGNOSTIC_PLOTS=false
+      - ACE_DIAGNOSTIC_CLEANUP_DAYS=30
     # command: python app.py --server_name 0.0.0.0 --port 7865 --share False --bf16 True --torch_compile True --device-id 0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7865/"]
