@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install Python and system dependencies
+# Install Python and system dependencies including FFmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     wget \
+    ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/python3 /usr/bin/python
@@ -31,21 +32,19 @@ RUN useradd -m -u 1001 appuser
 # Set working directory
 WORKDIR /app
 
-# Clone the repository
-RUN git clone https://github.com/ace-step/ACE-Step.git .
+# Copy the application files
+COPY . .
 
-# Install specific PyTorch version compatible with CUDA 12.6
+# Install PyTorch with CUDA 12.6 first, then other packages
 RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 && \
     pip3 install --no-cache-dir hf_transfer peft && \
-    pip3 install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+    pip3 install --no-cache-dir -r requirements.txt
 RUN pip3 install --no-cache-dir .
 
 # Ensure target directories for volumes exist and have correct initial ownership
 RUN mkdir -p /app/outputs /app/checkpoints /app/logs && \
-    chown -R appuser:appuser /app/outputs /app/checkpoints /app/logs
-
-# Change ownership of app files to appuser
-RUN chown -R appuser:appuser /app
+    chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser
@@ -59,5 +58,5 @@ VOLUME [ "/app/checkpoints", "/app/outputs", "/app/logs" ]
 HEALTHCHECK --interval=60s --timeout=10s --start-period=5s --retries=5 \
   CMD curl -f http://localhost:7865/ || exit 1
 
-# Command to run the application with GPU support
-CMD ["python3", "acestep/gui.py", "--server_name", "0.0.0.0", "--bf16", "true"]
+# Command to run the application with GPU support and optimizations
+CMD ["python3", "acestep/gui.py", "--server_name", "0.0.0.0", "--bf16", "true", "--torch_compile", "true", "--device_id", "0"]

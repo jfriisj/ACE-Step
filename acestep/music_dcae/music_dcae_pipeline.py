@@ -10,11 +10,11 @@ import os
 import torch
 from diffusers import AutoencoderDC
 import torchaudio
+import soundfile as sf
 import torchvision.transforms as transforms
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import FromOriginalModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from tqdm import tqdm
 
 try:
     from .music_vocoder import ADaMoSHiFiGANV1
@@ -206,7 +206,8 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     win_end_idx = min(latent_len, win_start_idx + dcae_win_len_latent)
                     
                     dcae_input_segment = current_latent[:, :, :, win_start_idx:win_end_idx]
-                    if dcae_input_segment.shape[3] == 0: continue
+                    if dcae_input_segment.shape[3] == 0:
+                        continue
 
                     mel_output_full = self.dcae.decoder(dcae_input_segment) # (1, C, H_mel, W_mel_fixed_from_dcae)
 
@@ -271,7 +272,7 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 p_audio_samples = vocoder_hop_len_audio 
                 conceptual_total_audio_len_native_sr = mel_total_frames * VOCODER_AUDIO_SAMPLES_PER_MEL_FRAME
                 
-                pbar_total = 1 + max(0, (conceptual_total_audio_len_native_sr - (vocoder_win_len_audio - vocoder_overlap_len_audio))) // vocoder_hop_len_audio
+                1 + max(0, (conceptual_total_audio_len_native_sr - (vocoder_win_len_audio - vocoder_overlap_len_audio))) // vocoder_hop_len_audio
                 
                 # Use tqdm if you want a progress bar for the vocoder part
                 # with tqdm(total=pbar_total, desc=f"Vocoder {latent_idx+1}/{len(latents)}", leave=False) as pbar:
@@ -281,11 +282,13 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     mel_frame_start = p_audio_samples // VOCODER_AUDIO_SAMPLES_PER_MEL_FRAME
                     mel_frame_end = mel_frame_start + vocoder_input_mel_frames_per_block
                     
-                    if mel_frame_start >= mel_total_frames: break # No more mel frames
+                    if mel_frame_start >= mel_total_frames:
+                        break  # No more mel frames
 
                     mel_block = concatenated_mels[0, :, :, mel_frame_start:min(mel_frame_end, mel_total_frames)].to(self.device)
                     
-                    if mel_block.shape[2] == 0: break # Should not happen if mel_frame_start is valid
+                    if mel_block.shape[2] == 0:
+                        break  # Should not happen if mel_frame_start is valid
 
                     # Pad if current mel_block is too short (end of sequence)
                     if mel_block.shape[2] < vocoder_input_mel_frames_per_block:
@@ -378,5 +381,18 @@ if __name__ == "__main__":
     print("latents shape: ", latents.shape)
     print("latent_lengths: ", latent_lengths)
     print("sr: ", sr)
-    torchaudio.save("test_reconstructed.wav", pred_wavs[0], sr)
+    # Use soundfile to avoid torchcodec issues
+    audio_data = pred_wavs[0].cpu().numpy()
+    # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
+    if audio_data.ndim == 3:  # Remove any extra dimensions
+        audio_data = audio_data.squeeze(0)
+    if audio_data.ndim == 2:
+        # If shape is (channels, samples), transpose to (samples, channels)
+        if audio_data.shape[0] < audio_data.shape[1]:
+            audio_data = audio_data.T
+        # If mono (1, samples) or (samples, 1), squeeze to 1D
+        if audio_data.shape[1] == 1:
+            audio_data = audio_data.squeeze(-1)
+    
+    sf.write("test_reconstructed.wav", audio_data, sr)
     print("test_reconstructed.wav")

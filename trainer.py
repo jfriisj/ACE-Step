@@ -4,7 +4,6 @@ from pytorch_lightning import Trainer
 from datetime import datetime
 import argparse
 import torch
-import json
 import matplotlib
 import torch.nn.functional as F
 import torch.utils.data
@@ -14,9 +13,9 @@ from acestep.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from acestep.text2music_dataset import Text2MusicDataset
-from loguru import logger
 from transformers import AutoModel, Wav2Vec2FeatureExtractor
 import torchaudio
+import soundfile as sf
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
     retrieve_timesteps,
 )
@@ -100,7 +99,7 @@ class Pipeline(LightningModule):
                 self.mert_model = AutoModel.from_pretrained(
                     "m-a-p/MERT-v1-330M", trust_remote_code=True, cache_dir=checkpoint_dir
                 ).eval()
-            except:
+            except (ImportError, OSError, ValueError, ConnectionError):
                 import json
                 import os
 
@@ -168,7 +167,7 @@ class Pipeline(LightningModule):
         # MERT SSL constraint
         # Define the length of each chunk (5 seconds of samples)
         chunk_size = 24000 * 5  # 5 seconds, 24000 samples per second
-        total_length = mert_input_wavs_mono_24k.shape[1]
+        mert_input_wavs_mono_24k.shape[1]
 
         num_chunks_per_audio = (actual_lengths_24k + chunk_size - 1) // chunk_size
 
@@ -804,12 +803,27 @@ class Pipeline(LightningModule):
             save_dir = f"{log_dir}/eval_results/step_{self.global_step}"
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir, exist_ok=True)
-            torchaudio.save(
-                f"{save_dir}/target_wav_{key}_{i}.wav", target_wav.float().cpu(), sr
-            )
-            torchaudio.save(
-                f"{save_dir}/pred_wav_{key}_{i}.wav", pred_wav.float().cpu(), sr
-            )
+            
+            # Use soundfile to avoid torchcodec issues
+            def process_audio_tensor(audio_tensor):
+                audio_numpy = audio_tensor.float().cpu().numpy()
+                # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
+                if audio_numpy.ndim == 3:  # Remove any extra dimensions
+                    audio_numpy = audio_numpy.squeeze(0)
+                if audio_numpy.ndim == 2:
+                    # If shape is (channels, samples), transpose to (samples, channels)
+                    if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                        audio_numpy = audio_numpy.T
+                    # If mono (1, samples) or (samples, 1), squeeze to 1D
+                    if audio_numpy.shape[1] == 1:
+                        audio_numpy = audio_numpy.squeeze(-1)
+                return audio_numpy
+            
+            target_audio = process_audio_tensor(target_wav)
+            sf.write(f"{save_dir}/target_wav_{key}_{i}.wav", target_audio, sr)
+            
+            pred_audio = process_audio_tensor(pred_wav)
+            sf.write(f"{save_dir}/pred_wav_{key}_{i}.wav", pred_audio, sr)
             with open(
                 f"{save_dir}/key_prompt_lyric_{key}_{i}.txt", "w", encoding="utf-8"
             ) as f:

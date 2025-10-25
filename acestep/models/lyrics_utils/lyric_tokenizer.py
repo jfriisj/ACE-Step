@@ -16,7 +16,11 @@ from spacy.lang.zh import Chinese
 from tokenizers import Tokenizer
 
 from .zh_num2words import TextNorm as zh_num2words
-from typing import Dict, List, Optional, Set, Union
+from typing import List, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+    import tensorflow as tf
 
 
 # copy from https://github.com/coqui-ai/TTS/blob/dbf1a08a0d4e47fdad6172e433eeb34bc6b13b4e/TTS/tts/layers/xtts/tokenizer.py
@@ -543,7 +547,7 @@ def expand_numbers_multilingual(text, lang="en"):
             text = re.sub(
                 _currency_re["EUR"], lambda m: _expand_currency(m, lang, "EUR"), text
             )
-        except:
+        except (KeyError, TypeError, AttributeError):
             pass
         if lang != "tr":
             text = re.sub(
@@ -571,15 +575,15 @@ def multilingual_cleaners(text, lang):
     text = lowercase(text)
     try:
         text = expand_numbers_multilingual(text, lang)
-    except:
+    except (KeyError, TypeError, AttributeError, ValueError):
         pass
     try:
         text = expand_abbreviations_multilingual(text, lang)
-    except:
+    except (KeyError, TypeError, AttributeError, ValueError):
         pass
     try:
         text = expand_symbols_multilingual(text, lang=lang)
-    except:
+    except (KeyError, TypeError, AttributeError, ValueError):
         pass
     text = collapse_whitespace(text)
     return text
@@ -654,7 +658,7 @@ class VoiceBpeTokenizer:
 
     def check_input_length(self, txt, lang):
         lang = lang.split("-")[0]  # remove the region
-        limit = self.char_limits.get(lang, 250)
+        self.char_limits.get(lang, 250)
         # if len(txt) > limit:
         #     print(
         #         f"[!] Warning: The text length exceeds the character limit of {limit} for language '{lang}', this might cause truncated audio."

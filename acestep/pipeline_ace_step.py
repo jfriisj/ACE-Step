@@ -47,6 +47,7 @@ from acestep.apg_guidance import (
     cfg_double_condition_forward,
 )
 import torchaudio
+import soundfile as sf
 from .cpu_offload import cpu_offload
 
 
@@ -158,17 +159,53 @@ class ACEStepPipeline:
         checkpoint_dir_models = None
         
         if checkpoint_dir is not None:
+            logger.info(f"Checking for models in checkpoint_dir: {checkpoint_dir}")
             required_dirs = ["music_dcae_f8c8", "music_vocoder", "ace_step_transformer", "umt5-base"]
+            
+            # First check if models exist directly in checkpoint_dir
             all_dirs_exist = True
             for dir_name in required_dirs:
                 dir_path = os.path.join(checkpoint_dir, dir_name)
+                logger.info(f"Checking direct path: {dir_path} - exists: {os.path.exists(dir_path)}")
                 if not os.path.exists(dir_path):
                     all_dirs_exist = False
                     break
             
             if all_dirs_exist:
-                logger.info(f"Load models from: {checkpoint_dir}")
+                logger.info(f"Load models from local checkpoint directory: {checkpoint_dir}")
                 checkpoint_dir_models = checkpoint_dir
+            else:
+                # Check if models exist in Hugging Face cache structure
+                repo_cache_name = repo.replace("/", "--")
+                hf_cache_path = os.path.join(checkpoint_dir, f"models--{repo_cache_name}")
+                logger.info(f"Checking HuggingFace cache path: {hf_cache_path} - exists: {os.path.exists(hf_cache_path)}")
+                
+                if os.path.exists(hf_cache_path):
+                    snapshots_dir = os.path.join(hf_cache_path, "snapshots")
+                    logger.info(f"Checking snapshots dir: {snapshots_dir} - exists: {os.path.exists(snapshots_dir)}")
+                    
+                    if os.path.exists(snapshots_dir):
+                        # Find the latest snapshot
+                        snapshot_dirs = os.listdir(snapshots_dir)
+                        logger.info(f"Available snapshots: {snapshot_dirs}")
+                        
+                        if snapshot_dirs:
+                            latest_snapshot = snapshot_dirs[0]  # Use first available snapshot
+                            snapshot_path = os.path.join(snapshots_dir, latest_snapshot)
+                            logger.info(f"Using snapshot: {snapshot_path}")
+                            
+                            # Check if required dirs exist in snapshot
+                            all_dirs_exist = True
+                            for dir_name in required_dirs:
+                                dir_path = os.path.join(snapshot_path, dir_name)
+                                logger.info(f"Checking snapshot path: {dir_path} - exists: {os.path.exists(dir_path)}")
+                                if not os.path.exists(dir_path):
+                                    all_dirs_exist = False
+                                    break
+                            
+                            if all_dirs_exist:
+                                logger.info(f"Load models from cached HuggingFace snapshot: {snapshot_path}")
+                                checkpoint_dir_models = snapshot_path
         
         if checkpoint_dir_models is None:
             if checkpoint_dir is None:
@@ -431,7 +468,7 @@ class ACEStepPipeline:
             language = langCounts[0][0]
             if len(langCounts) > 1 and language == "en":
                 language = langCounts[1][0]
-        except Exception as err:
+        except Exception:
             language = "en"
         return language
 
@@ -775,7 +812,7 @@ class ACEStepPipeline:
         infer_steps,
     ):
 
-        bsz = gt_latents.shape[0]
+        gt_latents.shape[0]
         if scheduler_type == "euler":
             scheduler = FlowMatchEulerDiscreteScheduler(
                 num_train_timesteps=1000,
@@ -1184,7 +1221,10 @@ class ACEStepPipeline:
 
             return sample
 
+        logger.info(f"Starting diffusion inference loop: {num_inference_steps} steps")
+        inference_start_time = time.time()
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
+            step_start_time = time.time()
 
             if is_repaint:
                 if i < n_min:
@@ -1333,6 +1373,13 @@ class ACEStepPipeline:
                     omega=omega_scale,
                     generator=random_generators[0],
                 )[0]
+            
+            step_time = time.time() - step_start_time
+            if i % 10 == 0:  # Log every 10 steps to avoid spam
+                logger.info(f"Inference step {i}/{num_inference_steps} completed in {step_time:.3f}s")
+
+        inference_time = time.time() - inference_start_time
+        logger.info(f"Diffusion inference completed in {inference_time:.2f} seconds")
 
         if is_extend:
             if to_right_pad_gt_latents is not None:
@@ -1354,15 +1401,27 @@ class ACEStepPipeline:
         save_path=None,
         format="wav",
     ):
+        import time
+        start_time = time.time()
+        logger.info(f"Starting latents2audio conversion. Latents shape: {latents.shape}, Duration: {target_wav_duration_second:.2f}s")
+        
         output_audio_paths = []
         bs = latents.shape[0]
         pred_latents = latents
+        
+        decode_start = time.time()
         with torch.no_grad():
             if self.overlapped_decode and target_wav_duration_second > 48:
+                logger.info("Using overlapped decode for duration > 48s")
                 _, pred_wavs = self.music_dcae.decode_overlap(pred_latents, sr=sample_rate)
             else:
+                logger.info("Using standard decode")
                 _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
+        decode_time = time.time() - decode_start
+        logger.info(f"Audio decoding completed in {decode_time:.2f} seconds")
+        
         pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
+        logger.info(f"Starting audio file saving for {bs} files")
         for i in tqdm(range(bs)):
             output_audio_path = self.save_wav_file(
                 pred_wavs[i],
@@ -1372,6 +1431,9 @@ class ACEStepPipeline:
                 format=format,
             )
             output_audio_paths.append(output_audio_path)
+        
+        total_time = time.time() - start_time
+        logger.info(f"latents2audio completed in {total_time:.2f} seconds total")
         return output_audio_paths
 
     def save_wav_file(
@@ -1393,13 +1455,63 @@ class ACEStepPipeline:
                 output_path_wav = save_path
 
         target_wav = target_wav.float()
-        backend = "soundfile"
-        if format == "ogg":
-            backend = "sox"
-        logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
-        torchaudio.save(
-            output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
-        )
+        
+        # Use soundfile directly for wav format to avoid torchcodec dependency issues
+        if format == "wav":
+            logger.info(f"Saving audio to {output_path_wav} using soundfile")
+            # Convert tensor to numpy and ensure proper shape
+            audio_numpy = target_wav.cpu().numpy()
+            
+            # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
+            if audio_numpy.ndim == 3:  # Remove any extra dimensions
+                audio_numpy = audio_numpy.squeeze(0)
+            if audio_numpy.ndim == 2:
+                # If shape is (channels, samples), transpose to (samples, channels)
+                if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                    audio_numpy = audio_numpy.T
+                # If mono (1, samples) or (samples, 1), squeeze to 1D
+                if audio_numpy.shape[1] == 1:
+                    audio_numpy = audio_numpy.squeeze(-1)
+            
+            sf.write(output_path_wav, audio_numpy, sample_rate)
+        else:
+            # Use torchaudio for other formats
+            backend = "soundfile"
+            if format == "ogg":
+                backend = "sox"
+            logger.info(f"Saving audio to {output_path_wav} using backend {backend}")
+            try:
+                torchaudio.save(
+                    output_path_wav, target_wav, sample_rate=sample_rate, format=format, backend=backend
+                )
+            except (RuntimeError, ImportError) as e:
+                if "torchcodec" in str(e).lower():
+                    # Fallback to soundfile for any torchcodec issues
+                    logger.warning(f"TorchAudio failed with torchcodec error, falling back to soundfile: {e}")
+                    
+                    # For soundfile fallback, convert to WAV format (soundfile works best with WAV)
+                    fallback_path = output_path_wav
+                    if not fallback_path.lower().endswith('.wav'):
+                        fallback_path = fallback_path.rsplit('.', 1)[0] + '.wav'
+                        logger.info(f"Converting format to WAV for soundfile compatibility: {fallback_path}")
+                    
+                    audio_numpy = target_wav.cpu().numpy()
+                    
+                    # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
+                    if audio_numpy.ndim == 3:  # Remove any extra dimensions
+                        audio_numpy = audio_numpy.squeeze(0)
+                    if audio_numpy.ndim == 2:
+                        # If shape is (channels, samples), transpose to (samples, channels)
+                        if audio_numpy.shape[0] < audio_numpy.shape[1]:
+                            audio_numpy = audio_numpy.T
+                        # If mono (1, samples) or (samples, 1), squeeze to 1D
+                        if audio_numpy.shape[1] == 1:
+                            audio_numpy = audio_numpy.squeeze(-1)
+                    
+                    sf.write(fallback_path, audio_numpy, sample_rate)
+                    output_path_wav = fallback_path  # Update the path to return the correct file
+                else:
+                    raise e
         return output_path_wav
 
     @cpu_offload("music_dcae")
@@ -1624,6 +1736,7 @@ class ACEStepPipeline:
                 scheduler_type=scheduler_type,
             )
         else:
+            logger.info(f"Starting diffusion process with {infer_step} inference steps")
             target_latents = self.text2music_diffusion_process(
                 duration=audio_duration,
                 encoder_text_hidden_states=encoder_text_hidden_states,
@@ -1659,8 +1772,10 @@ class ACEStepPipeline:
 
         end_time = time.time()
         diffusion_time_cost = end_time - start_time
+        logger.info(f"Diffusion process completed in {diffusion_time_cost:.2f} seconds")
         start_time = end_time
 
+        logger.info("Starting latents to audio conversion")
         output_paths = self.latents2audio(
             latents=target_latents,
             target_wav_duration_second=audio_duration,

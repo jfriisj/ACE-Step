@@ -1,11 +1,11 @@
 
 services:
-  &name ace-step:
+  ace-step:
     build:
-      context: https://github.com/ace-step/ACE-Step.git
+      context: .
       dockerfile: Dockerfile
-    container_name: *name
-    hostname: *name
+    container_name: ace-step
+    hostname: ace-step
     stop_grace_period: 2s
     ports:
       - "7865:7865"
@@ -13,6 +13,7 @@ services:
       - ./checkpoints:/app/checkpoints
       - ./outputs:/app/outputs
       - ./logs:/app/logs
+      - ./cache:/home/appuser/.cache
     environment:
       - ACE_OUTPUT_DIR=/app/outputs
     # command: python app.py --server_name 0.0.0.0 --port 7865 --share False --bf16 True --torch_compile True --device-id 0

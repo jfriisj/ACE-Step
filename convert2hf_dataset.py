@@ -1,6 +1,7 @@
+import argparse
+import os
 from datasets import Dataset
 from pathlib import Path
-import os
 
 def create_dataset(data_dir="./data", repeat_count=2000, output_name="zh_lora_dataset"):
     data_path = Path(data_dir)
@@ -28,14 +29,13 @@ def create_dataset(data_dir="./data", repeat_count=2000, output_name="zh_lora_da
                 "recaption": {}
             }
             all_examples.append(example)
-        except AssertionError as e:
+        except AssertionError:
             continue
 
     # repeat specified times
     ds = Dataset.from_list(all_examples * repeat_count)
     ds.save_to_disk(output_name)
 
-import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Create a dataset from audio files.")

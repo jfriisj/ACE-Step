@@ -1,5 +1,5 @@
 import torch
-import torchaudio
+import soundfile as sf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -10,7 +10,6 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import r
 from acestep.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from acestep.pipeline_ace_step import ACEStepPipeline
 from acestep.apg_guidance import apg_forward, MomentumBuffer
-from transformers import AutoTokenizer
 from loguru import logger
 import uvicorn
 import time
@@ -206,7 +205,21 @@ class InferencePipeline:
         output_dir = "generated_audio"
         os.makedirs(output_dir, exist_ok=True)
         audio_path = f"{output_dir}/generated_{timestamp}_{seed}.wav"
-        torchaudio.save(audio_path, pred_wavs.float().cpu(), sr)
+        
+        # Use soundfile to avoid torchcodec issues
+        audio_data = pred_wavs.float().cpu().numpy()
+        # Ensure we have the right shape: (samples,) for mono or (samples, channels) for multi-channel
+        if audio_data.ndim == 3:  # Remove any extra dimensions
+            audio_data = audio_data.squeeze(0)
+        if audio_data.ndim == 2:
+            # If shape is (channels, samples), transpose to (samples, channels)
+            if audio_data.shape[0] < audio_data.shape[1]:
+                audio_data = audio_data.T
+            # If mono (1, samples) or (samples, 1), squeeze to 1D
+            if audio_data.shape[1] == 1:
+                audio_data = audio_data.squeeze(-1)
+        
+        sf.write(audio_path, audio_data, sr)
 
         return audio_path, sr, seed
 
